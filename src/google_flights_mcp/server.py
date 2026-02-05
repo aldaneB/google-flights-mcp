@@ -108,11 +108,9 @@ def load_airports_cache() -> Dict[str, str]:
             print(f"Error loading airports cache: {e}", file=sys.stderr)
     return {}
 
-# Initialize the FastMCP server with dependencies
-mcp = FastMCP(
-    "google-flights-mcp",
-    dependencies=["fast-flights", "aiohttp"],
-)
+# Initialize the FastMCP server
+# Note: dependency installation should be handled by packaging (pyproject) / environment.
+mcp = FastMCP("google-flights-mcp")
 
 @mcp.tool()
 def search_flights(
@@ -222,12 +220,13 @@ def search_flights(
             ctx.report_progress(0.5, 1.0)
             
         # Get flight results
+        fetch_mode = os.environ.get("FAST_FLIGHTS_FETCH_MODE", "common")
         result: Result = get_flights(
             flight_data=flight_data,
             trip=trip_type,
             seat=seat_class,
             passengers=passengers,
-            fetch_mode="fallback",  # Use fallback mode for more reliable results
+            fetch_mode=fetch_mode,  # default: common (can set FAST_FLIGHTS_FETCH_MODE=fallback)
         )
         
         if ctx:
@@ -304,12 +303,13 @@ def search_flights_json(
             infants_on_lap=infants_on_lap,
         )
 
+        fetch_mode = os.environ.get("FAST_FLIGHTS_FETCH_MODE", "common")
         result: Result = get_flights(
             flight_data=flight_data,
             trip=trip_type,
             seat=seat_class,
             passengers=passengers,
-            fetch_mode="fallback",
+            fetch_mode=fetch_mode,
         )
 
         payload = serialize_flights(result, trip_type, int(max_results))
