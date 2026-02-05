@@ -1,5 +1,4 @@
-def main():
-    print("Hello from google-flights-mcp!")
+from google_flights_mcp.server import main
 
 
 if __name__ == "__main__":

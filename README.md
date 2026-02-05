@@ -1,6 +1,6 @@
-# Flight Planner MCP Server
+# google-flights-mcp
 
-A Model Context Protocol server that creates travel agent-level flight plans using the fast-flights API.
+An MCP server that creates travel agent-level flight plans using the **fast-flights** API.
 
 ## Features
 
@@ -22,10 +22,16 @@ pip install mcp fast-flights
 
 ### Running the Server
 
-You can run the server directly:
+Run via the installed CLI (recommended):
 
 ```bash
-python flight_planner_server.py
+google-flights-mcp
+```
+
+Or run the module directly:
+
+```bash
+python -m google_flights_mcp.server
 ```
 
 ### Integrating with Claude Desktop
@@ -41,13 +47,8 @@ python flight_planner_server.py
 {
   "mcpServers": {
     "flight-planner": {
-      "command": "python",
-      "args": [
-        "/PATH/TO/flight_planner_server.py"
-      ],
-      "env": {
-        "PYTHONPATH": "/PATH/TO/PROJECT"
-      }
+      "command": "google-flights-mcp",
+      "args": []
     }
   }
 }

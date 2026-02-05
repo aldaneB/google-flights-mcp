@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from google-flights-mcp!")
+__all__ = ['server']

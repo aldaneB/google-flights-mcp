@@ -16,8 +16,8 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
-# Print debug info to stderr (will be captured in Claude logs)
-print("Starting Flight Planner server...", file=sys.stderr)
+# Print debug info to stderr (captured by most MCP hosts)
+print("Starting google-flights-mcp server...", file=sys.stderr)
 
 try:
     from fastmcp import FastMCP, Context
@@ -35,7 +35,12 @@ DEFAULT_CONFIG = {
     "default_advance_days": 30,
     "seat_classes": ["economy", "premium_economy", "business", "first"]
 }
-AIRPORTS_CACHE_FILE = Path(__file__).parent / "airports_cache.json"
+# Cache file path (override with GOOGLE_FLIGHTS_MCP_AIRPORTS_CACHE)
+DEFAULT_CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+AIRPORTS_CACHE_FILE = Path(os.environ.get(
+    "GOOGLE_FLIGHTS_MCP_AIRPORTS_CACHE",
+    str(DEFAULT_CACHE_DIR / "google-flights-mcp" / "airports_cache.json"),
+))
 
 # Global variables
 airports = {}
@@ -74,9 +79,10 @@ async def fetch_airports_csv(url: str = CSV_URL) -> Dict[str, str]:
                 
                 # Save to cache file
                 try:
-                    with open(AIRPORTS_CACHE_FILE, 'w') as f:
+                    AIRPORTS_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    with open(AIRPORTS_CACHE_FILE, 'w', encoding='utf-8') as f:
                         json.dump(airports_data, f)
-                    print(f"Saved airports to cache file: {AIRPORTS_CACHE_FILE}", file=sys.stderr)
+                    print(f"Saved airports cache: {AIRPORTS_CACHE_FILE}", file=sys.stderr)
                 except Exception as cache_e:
                     print(f"Warning: Could not save airports cache: {cache_e}", file=sys.stderr)
                 
@@ -94,7 +100,7 @@ def load_airports_cache() -> Dict[str, str]:
     """Load airports from cache file if available."""
     if AIRPORTS_CACHE_FILE.exists():
         try:
-            with open(AIRPORTS_CACHE_FILE, 'r') as f:
+            with open(AIRPORTS_CACHE_FILE, 'r', encoding='utf-8') as f:
                 cache = json.load(f)
                 print(f"Loaded {len(cache)} airports from cache", file=sys.stderr)
                 return cache
@@ -104,13 +110,13 @@ def load_airports_cache() -> Dict[str, str]:
 
 # Initialize the FastMCP server with dependencies
 mcp = FastMCP(
-    "Flight Planner", 
-    dependencies=["fast-flights", "aiohttp"]
+    "google-flights-mcp",
+    dependencies=["fast-flights", "aiohttp"],
 )
 
 @mcp.tool()
 def search_flights(
-    from_airport: str, 
+    from_airport: str,
     to_airport: str,
     departure_date: str,
     return_date: Optional[str] = None,
@@ -119,7 +125,7 @@ def search_flights(
     infants_in_seat: int = 0,
     infants_on_lap: int = 0,
     seat_class: str = "economy",
-    ctx: Context = None
+    ctx: Context = None,
 ) -> str:
     """
     Search for flights between two airports.
@@ -230,63 +236,175 @@ def search_flights(
             
         # Format results
         return format_flight_results(result, trip_type, DEFAULT_CONFIG["max_results"])
-        
+
     except Exception as e:
         error_msg = f"Error searching for flights: {str(e)}"
         if ctx:
             ctx.error(error_msg)
         return error_msg
 
-def format_flight_results(result, trip_type: str, max_results: int) -> str:
+
+@mcp.tool()
+def search_flights_json(
+    from_airport: str,
+    to_airport: str,
+    departure_date: str,
+    return_date: Optional[str] = None,
+    adults: int = 1,
+    children: int = 0,
+    infants_in_seat: int = 0,
+    infants_on_lap: int = 0,
+    seat_class: str = "economy",
+    max_results: int = 10,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """Same as `search_flights` but returns structured JSON for UI/rendering."""
+    # Reuse the same validation + query path by calling the underlying library directly.
+    # Keep this duplicated minimally to avoid parsing the formatted string.
+
+    if ctx:
+        ctx.info(f"Searching flights (json) from {from_airport} to {to_airport}")
+
+    # Validate inputs (reuse same rules)
+    try:
+        departure_dt = datetime.strptime(departure_date, "%Y-%m-%d")
+        if return_date:
+            return_dt = datetime.strptime(return_date, "%Y-%m-%d")
+            if return_dt < departure_dt:
+                return {"error": "Return date cannot be before departure date."}
+        if len(from_airport) != 3 or len(to_airport) != 3:
+            return {"error": "Airport codes must be 3-letter IATA codes."}
+        from_airport = from_airport.upper()
+        to_airport = to_airport.upper()
+        if from_airport not in airports:
+            return {"error": f"Departure airport code '{from_airport}' not found."}
+        if to_airport not in airports:
+            return {"error": f"Arrival airport code '{to_airport}' not found."}
+        if adults < 1:
+            return {"error": "At least one adult passenger is required."}
+        if any(num < 0 for num in [adults, children, infants_in_seat, infants_on_lap]):
+            return {"error": "Passenger numbers cannot be negative."}
+        valid_classes = DEFAULT_CONFIG["seat_classes"]
+        if seat_class.lower() not in valid_classes:
+            return {"error": f"Seat class must be one of {', '.join(valid_classes)}."}
+    except ValueError:
+        return {"error": "Invalid date format. Use YYYY-MM-DD."}
+
+    try:
+        from fast_flights import FlightData, Passengers, Result, get_flights
+
+        flight_data = [FlightData(date=departure_date, from_airport=from_airport, to_airport=to_airport)]
+        if return_date:
+            flight_data.append(FlightData(date=return_date, from_airport=to_airport, to_airport=from_airport))
+        trip_type = "round-trip" if return_date else "one-way"
+        passengers = Passengers(
+            adults=adults,
+            children=children,
+            infants_in_seat=infants_in_seat,
+            infants_on_lap=infants_on_lap,
+        )
+
+        result: Result = get_flights(
+            flight_data=flight_data,
+            trip=trip_type,
+            seat=seat_class,
+            passengers=passengers,
+            fetch_mode="fallback",
+        )
+
+        payload = serialize_flights(result, trip_type, int(max_results))
+        payload["query"] = {
+            "from": from_airport,
+            "to": to_airport,
+            "departure_date": departure_date,
+            "return_date": return_date,
+            "adults": adults,
+            "children": children,
+            "infants_in_seat": infants_in_seat,
+            "infants_on_lap": infants_on_lap,
+            "seat_class": seat_class,
+        }
+        return payload
+    except Exception as e:
+        if ctx:
+            ctx.error(f"Error searching flights (json): {e}")
+        return {"error": f"Error searching flights: {str(e)}"}
+
+def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def serialize_flights(result: Any, trip_type: str, max_results: int) -> Dict[str, Any]:
+    """Serialize flight results into a JSON-friendly dict."""
+    flights = _get_attr(result, "flights") or []
+    out: Dict[str, Any] = {
+        "trip_type": trip_type,
+        "count": len(flights),
+        "max_results": max_results,
+        "price_assessment": _get_attr(result, "current_price"),
+        "flights": [],
+    }
+
+    for flight in flights[:max_results]:
+        out["flights"].append(
+            {
+                "airline": _get_attr(flight, "name"),
+                "departure": _get_attr(flight, "departure"),
+                "arrival": _get_attr(flight, "arrival"),
+                "arrives": _get_attr(flight, "arrival_time_ahead"),
+                "duration": _get_attr(flight, "duration"),
+                "stops": _get_attr(flight, "stops"),
+                "delay": _get_attr(flight, "delay"),
+                "price": _get_attr(flight, "price"),
+                "is_best": bool(_get_attr(flight, "is_best", False)),
+            }
+        )
+
+    return out
+
+
+def format_flight_results(result: Any, trip_type: str, max_results: int) -> str:
     """Format flight results into a readable string."""
-    if not result or not hasattr(result, 'flights') or not result.flights:
+    data = serialize_flights(result, trip_type, max_results)
+    if not data["flights"]:
         return "No flights found matching your criteria."
-    
-    output = []
-    output.append(f"Found {len(result.flights)} flight options.")
-    
-    if hasattr(result, 'current_price'):
-        output.append(f"Price assessment: {result.current_price}")
-    
-    output.append("\n")
-    
-    for i, flight in enumerate(result.flights[:max_results], 1):  # Limit to max results
-        best_tag = " [BEST OPTION]" if hasattr(flight, 'is_best') and flight.is_best else ""
+
+    output: List[str] = []
+    output.append(f"Found {data['count']} flight options.")
+    if data.get("price_assessment"):
+        output.append(f"Price assessment: {data['price_assessment']}")
+    output.append("")
+
+    for i, f in enumerate(data["flights"], 1):
+        best_tag = " [BEST OPTION]" if f.get("is_best") else ""
         output.append(f"Option {i}{best_tag}:")
-        
-        if hasattr(flight, 'name'):
-            output.append(f"  Airline: {flight.name}")
-        
-        if hasattr(flight, 'departure'):
-            output.append(f"  Departure: {flight.departure}")
-        
-        if hasattr(flight, 'arrival'):
-            output.append(f"  Arrival: {flight.arrival}")
-        
-        if hasattr(flight, 'arrival_time_ahead') and flight.arrival_time_ahead:
-            output.append(f"  Arrives: {flight.arrival_time_ahead}")
-            
-        if hasattr(flight, 'duration'):
-            output.append(f"  Duration: {flight.duration}")
-        
-        if hasattr(flight, 'stops'):
-            output.append(f"  Stops: {flight.stops}")
-        
-        if hasattr(flight, 'delay') and flight.delay:
-            output.append(f"  Delay: {flight.delay}")
-            
-        if hasattr(flight, 'price'):
-            output.append(f"  Price: {flight.price}")
-        
+        if f.get("airline"):
+            output.append(f"  Airline: {f['airline']}")
+        if f.get("departure"):
+            output.append(f"  Departure: {f['departure']}")
+        if f.get("arrival"):
+            output.append(f"  Arrival: {f['arrival']}")
+        if f.get("arrives"):
+            output.append(f"  Arrives: {f['arrives']}")
+        if f.get("duration"):
+            output.append(f"  Duration: {f['duration']}")
+        if f.get("stops"):
+            output.append(f"  Stops: {f['stops']}")
+        if f.get("delay"):
+            output.append(f"  Delay: {f['delay']}")
+        if f.get("price"):
+            output.append(f"  Price: {f['price']}")
         output.append("")
-    
-    if len(result.flights) > max_results:
-        output.append(f"... and {len(result.flights) - max_results} more flight options available.")
-    
+
+    if data["count"] > max_results:
+        output.append(f"... and {data['count'] - max_results} more flight options available.")
     if trip_type == "round-trip":
         output.append("Note: Price shown is for the entire round trip.")
-    
-    return "\n".join(output)
+
+    return "\n".join(output).strip() + "\n"
 
 @mcp.tool()
 def airport_search(query: str, ctx: Context = None) -> str:
@@ -463,19 +581,16 @@ async def initialize_airports():
     
     print(f"Initialized with {len(airports)} airports", file=sys.stderr)
 
+def main() -> None:
+    """CLI entrypoint."""
+    print("Initializing airports database...", file=sys.stderr)
+    asyncio.run(initialize_airports())
+
+    print("Starting server - waiting for connections...", file=sys.stderr)
+    # This will keep the server running until interrupted
+    mcp.run()
+
+
 # Run the server
 if __name__ == "__main__":
-    print("Initializing airports database...", file=sys.stderr)
-    # Run the initialization in an event loop
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(initialize_airports())
-    
-    print("Starting server - waiting for connections...", file=sys.stderr)
-    try:
-        # This will keep the server running until interrupted
-        mcp.run()
-    except Exception as e:
-        print(f"Error running server: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+    main()
