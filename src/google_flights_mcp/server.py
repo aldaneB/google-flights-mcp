@@ -228,11 +228,28 @@ def search_flights(
             passengers=passengers,
             fetch_mode=fetch_mode,  # default: common (can set FAST_FLIGHTS_FETCH_MODE=fallback)
         )
-        
+
+        # Best-effort: attach stop airport codes to each Flight object so formatting can include them.
+        try:
+            stop_lists = _enrich_stop_airports(
+                flight_data=flight_data,
+                trip_type=trip_type,
+                passengers=passengers,
+                seat_class=seat_class,
+                origin=from_airport,
+                dest=to_airport,
+                max_results=DEFAULT_CONFIG["max_results"],
+            )
+            for i, stops in enumerate(stop_lists):
+                if i < len(result.flights):
+                    setattr(result.flights[i], "stop_airports", stops)
+        except Exception:
+            pass
+
         if ctx:
             ctx.info("Processing flight results")
             ctx.report_progress(1.0, 1.0)
-            
+
         # Format results
         return format_flight_results(result, trip_type, DEFAULT_CONFIG["max_results"])
 
@@ -318,32 +335,18 @@ def search_flights_json(
 
         # Best-effort: extract layover airport codes from the HTML card text.
         try:
-            from fast_flights.filter import TFSData
-            from fast_flights.primp import Client
-            from selectolax.lexbor import LexborHTMLParser
-
-            tfs = TFSData.from_interface(
+            stop_lists = _enrich_stop_airports(
                 flight_data=flight_data,
-                trip=trip_type,
+                trip_type=trip_type,
                 passengers=passengers,
-                seat=seat_class,
-            ).as_b64().decode("utf-8")
-
-            params = {"tfs": tfs, "hl": "en", "tfu": "EgQIABABIgA"}
-            html_res = Client(impersonate="chrome_126", verify=False).get(
-                "https://www.google.com/travel/flights", params=params
+                seat_class=seat_class,
+                origin=from_airport,
+                dest=to_airport,
+                max_results=int(max_results),
             )
-            if html_res.status_code == 200:
-                parser = LexborHTMLParser(html_res.text)
-                containers = parser.css('div[jsname="IWWDBc"], div[jsname="YdtKid"]')
-                # First container typically holds the primary list.
-                if containers:
-                    items = containers[0].css("ul.Rk10dc li")
-                    for i, item in enumerate(items[: int(max_results)]):
-                        text = " ".join(item.text(separator=" ", strip=True).split())
-                        stops = _extract_stop_airports(text, from_airport, to_airport)
-                        if i < len(payload.get("flights", [])):
-                            payload["flights"][i]["stop_airports"] = stops
+            for i, stops in enumerate(stop_lists):
+                if i < len(payload.get("flights", [])):
+                    payload["flights"][i]["stop_airports"] = stops
         except Exception:
             # Do not fail the whole call if enrichment breaks.
             pass
@@ -386,6 +389,55 @@ def _extract_stop_airports(text: str, origin: str, dest: str) -> List[str]:
         if c not in stops:
             stops.append(c)
     return stops
+
+
+def _enrich_stop_airports(
+    *,
+    flight_data: Any,
+    trip_type: str,
+    passengers: Any,
+    seat_class: str,
+    origin: str,
+    dest: str,
+    max_results: int,
+) -> List[List[str]]:
+    """Fetch the Google Flights page and extract stop airports for the first N results.
+
+    Returns a list of stop lists aligned by result index.
+    Fails open (returns []) on any error.
+    """
+    try:
+        from fast_flights.filter import TFSData
+        from fast_flights.primp import Client
+        from selectolax.lexbor import LexborHTMLParser
+
+        tfs = TFSData.from_interface(
+            flight_data=flight_data,
+            trip=trip_type,
+            passengers=passengers,
+            seat=seat_class,
+        ).as_b64().decode("utf-8")
+
+        params = {"tfs": tfs, "hl": "en", "tfu": "EgQIABABIgA"}
+        html_res = Client(impersonate="chrome_126", verify=False).get(
+            "https://www.google.com/travel/flights", params=params
+        )
+        if html_res.status_code != 200:
+            return []
+
+        parser = LexborHTMLParser(html_res.text)
+        containers = parser.css('div[jsname="IWWDBc"], div[jsname="YdtKid"]')
+        if not containers:
+            return []
+
+        items = containers[0].css("ul.Rk10dc li")
+        out: List[List[str]] = []
+        for item in items[: int(max_results)]:
+            text = " ".join(item.text(separator=" ", strip=True).split())
+            out.append(_extract_stop_airports(text, origin, dest))
+        return out
+    except Exception:
+        return []
 
 
 def serialize_flights(result: Any, trip_type: str, max_results: int) -> Dict[str, Any]:
@@ -444,8 +496,10 @@ def format_flight_results(result: Any, trip_type: str, max_results: int) -> str:
             output.append(f"  Arrives: {f['arrives']}")
         if f.get("duration"):
             output.append(f"  Duration: {f['duration']}")
-        if f.get("stops"):
+        if f.get("stops") is not None:
             output.append(f"  Stops: {f['stops']}")
+        if f.get("stop_airports"):
+            output.append(f"  Stop(s): {', '.join(f['stop_airports'])}")
         if f.get("delay"):
             output.append(f"  Delay: {f['delay']}")
         if f.get("price"):
