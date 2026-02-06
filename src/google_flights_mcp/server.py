@@ -257,9 +257,11 @@ def search_flights_json(
     max_results: int = 10,
     ctx: Context = None,
 ) -> Dict[str, Any]:
-    """Same as `search_flights` but returns structured JSON for UI/rendering."""
-    # Reuse the same validation + query path by calling the underlying library directly.
-    # Keep this duplicated minimally to avoid parsing the formatted string.
+    """Same as `search_flights` but returns structured JSON for UI/rendering.
+
+    Best-effort enhancement: attempts to extract stop/layover airport IATA codes
+    from the Google Flights results page.
+    """
 
     if ctx:
         ctx.info(f"Searching flights (json) from {from_airport} to {to_airport}")
@@ -313,6 +315,39 @@ def search_flights_json(
         )
 
         payload = serialize_flights(result, trip_type, int(max_results))
+
+        # Best-effort: extract layover airport codes from the HTML card text.
+        try:
+            from fast_flights.filter import TFSData
+            from fast_flights.primp import Client
+            from selectolax.lexbor import LexborHTMLParser
+
+            tfs = TFSData.from_interface(
+                flight_data=flight_data,
+                trip=trip_type,
+                passengers=passengers,
+                seat=seat_class,
+            ).as_b64().decode("utf-8")
+
+            params = {"tfs": tfs, "hl": "en", "tfu": "EgQIABABIgA"}
+            html_res = Client(impersonate="chrome_126", verify=False).get(
+                "https://www.google.com/travel/flights", params=params
+            )
+            if html_res.status_code == 200:
+                parser = LexborHTMLParser(html_res.text)
+                containers = parser.css('div[jsname="IWWDBc"], div[jsname="YdtKid"]')
+                # First container typically holds the primary list.
+                if containers:
+                    items = containers[0].css("ul.Rk10dc li")
+                    for i, item in enumerate(items[: int(max_results)]):
+                        text = " ".join(item.text(separator=" ", strip=True).split())
+                        stops = _extract_stop_airports(text, from_airport, to_airport)
+                        if i < len(payload.get("flights", [])):
+                            payload["flights"][i]["stop_airports"] = stops
+        except Exception:
+            # Do not fail the whole call if enrichment breaks.
+            pass
+
         payload["query"] = {
             "from": from_airport,
             "to": to_airport,
@@ -337,6 +372,22 @@ def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
         return default
 
 
+def _extract_stop_airports(text: str, origin: str, dest: str) -> List[str]:
+    """Best-effort extraction of stop airport IATA codes from a flight card text."""
+    import re
+
+    codes = re.findall(r"\b[A-Z]{3}\b", text)
+    origin = origin.upper()
+    dest = dest.upper()
+    stops: List[str] = []
+    for c in codes:
+        if c in (origin, dest):
+            continue
+        if c not in stops:
+            stops.append(c)
+    return stops
+
+
 def serialize_flights(result: Any, trip_type: str, max_results: int) -> Dict[str, Any]:
     """Serialize flight results into a JSON-friendly dict."""
     flights = _get_attr(result, "flights") or []
@@ -357,6 +408,8 @@ def serialize_flights(result: Any, trip_type: str, max_results: int) -> Dict[str
                 "arrives": _get_attr(flight, "arrival_time_ahead"),
                 "duration": _get_attr(flight, "duration"),
                 "stops": _get_attr(flight, "stops"),
+                # may be filled by enriched parser
+                "stop_airports": _get_attr(flight, "stop_airports"),
                 "delay": _get_attr(flight, "delay"),
                 "price": _get_attr(flight, "price"),
                 "is_best": bool(_get_attr(flight, "is_best", False)),
